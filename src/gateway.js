@@ -258,11 +258,11 @@ export async function startGateway() {
     console.log('Auto-set primary model to anthropic/claude-haiku-4-5 (Optimise default)');
   }
 
-  // Inject required aliases without overwriting existing user-defined ones
+  // Inject required aliases and caching params without overwriting existing user-defined ones
   config.agents.defaults.models = config.agents.defaults.models || {};
   const requiredModels = {
-    "anthropic/claude-opus-4-6": { "alias": "opus" },
-    "anthropic/claude-sonnet-4-6": { "alias": "sonnet" },
+    "anthropic/claude-opus-4-6": { "alias": "opus", "params": { "cacheRetention": "long" } },
+    "anthropic/claude-sonnet-4-6": { "alias": "sonnet", "params": { "cacheRetention": "short" } },
     "anthropic/claude-haiku-4-5": { "alias": "haiku" },
     "openai/gpt-5-mini": { "alias": "gpt-5-mini" },
     "openai/gpt-5.1": { "alias": "gpt-5.1" },
@@ -272,19 +272,35 @@ export async function startGateway() {
     "deepseek/deepseek-reasoner": { "alias": "deepseek-r1" }
   };
 
-  let injectedAliases = 0;
+  let injectedOverrides = 0;
   for (const [providerModel, defaultSettings] of Object.entries(requiredModels)) {
     if (!config.agents.defaults.models[providerModel]) {
       config.agents.defaults.models[providerModel] = defaultSettings;
-      injectedAliases++;
-    } else if (!config.agents.defaults.models[providerModel].alias) {
-      config.agents.defaults.models[providerModel].alias = defaultSettings.alias;
-      injectedAliases++;
+      injectedOverrides++;
+    } else {
+      let updated = false;
+      if (!config.agents.defaults.models[providerModel].alias) {
+        config.agents.defaults.models[providerModel].alias = defaultSettings.alias;
+        updated = true;
+      }
+      if (defaultSettings.params && !config.agents.defaults.models[providerModel].params) {
+        config.agents.defaults.models[providerModel].params = defaultSettings.params;
+        updated = true;
+      }
+      if (updated) injectedOverrides++;
     }
   }
-  if (injectedAliases > 0) {
-    console.log(`Auto-injected ${injectedAliases} missing model aliases for Optimise service routing`);
+  if (injectedOverrides > 0) {
+    console.log(`Auto-injected ${injectedOverrides} model settings (aliases/caching) for Optimise service`);
   }
+
+  // Inject Advanced Prompt Caching & Context Pruning Rules
+  config.agents.defaults.heartbeat = config.agents.defaults.heartbeat || { "every": "55m" };
+  config.agents.defaults.contextPruning = config.agents.defaults.contextPruning || {
+    "mode": "cache-ttl",
+    "ttl": "1h"
+  };
+  console.log('Auto-injected Heartbeat and Context Pruning settings for token optimization');
 
   // NOTE: Default SOUL.md creation has been moved to the PRE-BOOT OPTIMIZATION INJECTION section below.
   // The optimized SOUL.md with model routing rules will be written there instead.
