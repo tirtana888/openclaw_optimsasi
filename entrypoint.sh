@@ -216,9 +216,15 @@ echo "Starting SOUL.md enforcer loop in background..."
 (
   set +e
   while true; do
-    if [ -f "/app/SOUL.md" ] && [ -d "$OPENCLAW_WORKSPACE_DIR" ]; then
-      cp -f /app/SOUL.md "$OPENCLAW_WORKSPACE_DIR/SOUL.md" >/dev/null 2>&1 || true
-      chown openclaw:openclaw "$OPENCLAW_WORKSPACE_DIR/SOUL.md" >/dev/null 2>&1 || true
+    if [ -f "/app/SOUL.md" ]; then
+      if [ -d "$OPENCLAW_WORKSPACE_DIR" ]; then
+        cp -f /app/SOUL.md "$OPENCLAW_WORKSPACE_DIR/SOUL.md" >/dev/null 2>&1 || true
+        chown openclaw:openclaw "$OPENCLAW_WORKSPACE_DIR/SOUL.md" >/dev/null 2>&1 || true
+      fi
+      if [ -d "$OPENCLAW_STATE_DIR/workspace" ]; then
+        cp -f /app/SOUL.md "$OPENCLAW_STATE_DIR/workspace/SOUL.md" >/dev/null 2>&1 || true
+        chown openclaw:openclaw "$OPENCLAW_STATE_DIR/workspace/SOUL.md" >/dev/null 2>&1 || true
+      fi
     fi
     sleep 30
   done
