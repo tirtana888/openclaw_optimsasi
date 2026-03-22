@@ -1615,10 +1615,12 @@ const openclawHandler = (req, res, next) => {
     return next();
   }
   if (!isGatewayRunning()) {
-    return res.status(503).json({
-      error: 'Service Unavailable',
-      message: 'OpenClaw gateway is not running. Visit /onboard to start it.'
-    });
+    const configFile = join(OPENCLAW_STATE_DIR, 'openclaw.json');
+    if (existsSync(configFile)) {
+      return res.redirect('/lite');
+    } else {
+      return res.redirect('/onboard');
+    }
   }
   const token = getGatewayToken();
   // Preserve existing query params (e.g. ?session=...) and add token
@@ -1637,6 +1639,15 @@ app.get('/openclaw/{*path}', openclawHandler);  // catch subpath refreshes like 
 // (/{*path} would set req.url to "/" for every request, breaking the proxy)
 app.use((req, res, next) => {
   if (!isGatewayRunning()) {
+    const acceptsHtml = req.headers.accept && req.headers.accept.includes('text/html');
+    if (acceptsHtml) {
+      const configFile = join(OPENCLAW_STATE_DIR, 'openclaw.json');
+      if (existsSync(configFile)) {
+        return res.redirect('/lite');
+      } else {
+        return res.redirect('/onboard');
+      }
+    }
     return res.status(503).json({
       error: 'Service Unavailable',
       message: 'OpenClaw gateway is not running. Visit /onboard to start it.'
