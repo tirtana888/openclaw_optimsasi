@@ -209,22 +209,37 @@ echo ""
 
 # ==============================================================================
 # FIRST BOOT SEEDING: SOUL.md
-# Seed the default SOUL.md if it doesn't exist, but respect user modifications.
+# Seed the default SOUL.md if it doesn't exist or if template version jumps.
 # ==============================================================================
-SOUL_PATH="${OPENCLAW_WORKSPACE_DIR:-/data/workspace}/SOUL.md"
+SOUL_PATH_WORKSPACE="${OPENCLAW_WORKSPACE_DIR:-/data/workspace}/SOUL.md"
+SOUL_PATH_STATE="${OPENCLAW_STATE_DIR:-/data/.openclaw}/workspace/SOUL.md"
+SOUL_VERSION_MARKER="${OPENCLAW_STATE_DIR:-/data/.openclaw}/.soul-template-version"
+TEMPLATE_VERSION="v2"
 
-if [ ! -f "$SOUL_PATH" ]; then
+CURRENT_VERSION=""
+if [ -f "$SOUL_VERSION_MARKER" ]; then
+    CURRENT_VERSION=$(cat "$SOUL_VERSION_MARKER")
+fi
+
+if [ ! -f "$SOUL_PATH_WORKSPACE" ] || [ ! -f "$SOUL_PATH_STATE" ] || [ "$CURRENT_VERSION" != "$TEMPLATE_VERSION" ]; then
   if [ -f "/app/soul-template.md" ]; then
-    echo "SOUL.md not found in workspace, seeding from template..."
-    mkdir -p "$(dirname "$SOUL_PATH")"
-    cp /app/soul-template.md "$SOUL_PATH"
+    echo "Seeding SOUL.md (template $TEMPLATE_VERSION)..."
+    
+    mkdir -p "$(dirname "$SOUL_PATH_WORKSPACE")"
+    cp /app/soul-template.md "$SOUL_PATH_WORKSPACE"
+    
+    mkdir -p "$(dirname "$SOUL_PATH_STATE")"
+    cp /app/soul-template.md "$SOUL_PATH_STATE"
+    
+    echo "$TEMPLATE_VERSION" > "$SOUL_VERSION_MARKER"
+    
     if [ "$(id -u)" = "0" ]; then
-        chown openclaw:openclaw "$SOUL_PATH" >/dev/null 2>&1 || true
+        chown openclaw:openclaw "$SOUL_PATH_WORKSPACE" "$SOUL_PATH_STATE" "$SOUL_VERSION_MARKER" >/dev/null 2>&1 || true
     fi
-    echo "SOUL.md seeded."
+    echo "SOUL.md seeded to workdirs."
   fi
 else
-  echo "SOUL.md already exists in workspace, skipping seed."
+  echo "SOUL.md already exists (template $TEMPLATE_VERSION), skipping seed."
 fi
 # Start the wrapper server (drop to openclaw user if running as root)
 if [ "$(id -u)" = "0" ]; then
