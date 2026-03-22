@@ -246,16 +246,8 @@ export async function startGateway() {
   config.agents.defaults = config.agents.defaults || {};
   delete config.agents.defaults.persona;
 
-  // Write a default SOUL.md (identity/persona only) if one doesn't already exist.
-  // Tool awareness belongs in TOOLS.md, which is injected for all agents + sub-agents.
-  const soulPath = join(workspaceDir, 'SOUL.md');
-  if (!existsSync(soulPath)) {
-    writeFileSync(soulPath,
-      '# Soul\n\n' +
-      'You are a helpful, knowledgeable AI assistant running inside an OpenClaw gateway on Railway.\n',
-      'utf8');
-    console.log('Wrote default SOUL.md');
-  }
+  // NOTE: Default SOUL.md creation has been moved to the PRE-BOOT OPTIMIZATION INJECTION section below.
+  // The optimized SOUL.md with model routing rules will be written there instead.
 
   // Inject gateway settings (always overwritten by wrapper)
   config.gateway = config.gateway || {};
