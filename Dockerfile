@@ -118,8 +118,9 @@ COPY --from=wrapper-builder /app/node_modules ./node_modules
 COPY --from=wrapper-builder /app/src ./src
 COPY --from=wrapper-builder /app/package.json ./package.json
 
-# Copy entrypoint script
+# Copy entrypoint script and SOUL.md
 COPY entrypoint.sh /entrypoint.sh
+COPY SOUL.md /app/SOUL.md
 RUN chmod +x /entrypoint.sh
 
 # Copy pre-bundled skills (Railway-optimized)

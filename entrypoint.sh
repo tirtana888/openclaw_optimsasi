@@ -207,6 +207,22 @@ else
 fi
 echo ""
 
+# ==============================================================================
+# FAILSAFE: Hardcode SOUL.md
+# Run a background loop that constantly copies the static SOUL.md from /app
+# to the workspace, ensuring no Node.js process can ever permanently overwrite it.
+# ==============================================================================
+echo "Starting SOUL.md enforcer loop in background..."
+(
+  while true; do
+    if [ -f "/app/SOUL.md" ] && [ -d "$OPENCLAW_WORKSPACE_DIR" ]; then
+      cp /app/SOUL.md "$OPENCLAW_WORKSPACE_DIR/SOUL.md"
+      chown openclaw:openclaw "$OPENCLAW_WORKSPACE_DIR/SOUL.md" 2>/dev/null || true
+    fi
+    sleep 30
+  done
+) &
+
 # Start the wrapper server (drop to openclaw user if running as root)
 if [ "$(id -u)" = "0" ]; then
     exec su -s /bin/bash openclaw -c "exec node /app/src/server.js"
