@@ -97,7 +97,12 @@ const AUTH_GROUPS = [
     description: 'Claude Opus, Sonnet, Haiku',
     emoji: '\u{1F9E0}',
     options: [
-      { label: 'API Key', value: 'anthropic-api-key', flag: '--anthropic-api-key' },
+      { label: 'API Key', value: 'anthropic-api-key', flag: '--anthropic-api-key',
+        extraFields: [
+          { id: 'opt-openai-key', label: 'OpenAI API Key (Optional)', placeholder: 'sk-...', optional: true, hint: 'Used for GPT-5-Mini and GPT-5.1 fallbacks' },
+          { id: 'opt-deepseek-key', label: 'DeepSeek API Key (Optional)', placeholder: 'sk-...', optional: true, hint: 'Used for DeepSeek-R1 and DeepSeek-Chat fallbacks' }
+        ]
+      },
       { label: 'Setup Token', value: 'setup-token',
         flag: ['--auth-choice', 'token', '--token-provider', 'anthropic'],
         secretFlag: '--token' }
@@ -769,6 +774,32 @@ app.post('/onboard/api/run', authMiddleware, async (req, res) => {
           logs.push('Gateway stabilized after config change.');
         } else {
           logs.push('Warning: gateway did not stabilize after config change');
+        }
+      }
+    }
+
+    // --- OpenClaw Optimise: Inject Optional Multi-Provider Keys ---
+    // If the user provided OpenAI or DeepSeek keys in the extra fields on the Anthropic page, 
+    // we inject them now so fallbacks work immediately.
+    if (extraFieldValues) {
+      const additionalKeys = [
+        { id: 'opt-openai-key', provider: 'openai', flag: '--openai-api-key' },
+        { id: 'opt-deepseek-key', provider: 'deepseek', flag: '--auth-choice custom-api-key --custom-compatibility openai --custom-base-url https://api.deepseek.com --custom-api-key' }
+      ];
+
+      for (const item of additionalKeys) {
+        const keyVal = extraFieldValues[item.id];
+        if (keyVal) {
+          logs.push(`Configuring ${item.provider} as additional provider...`);
+          // Note: Using 'onboard' with non-interactive to add providers is tricky,
+          // so we use 'config set' to directly inject the secrets.
+          // OpenClaw CLI 'config set secrets.providers.<name> <val>'
+          const result = await runCmd('config', ['set', `secrets.providers.${item.provider}`, keyVal]);
+          if (result.code === 0) {
+            logs.push(`Successfully added ${item.provider} API key.`);
+          } else {
+            logs.push(`Warning: failed to add ${item.provider} key: ${result.stderr || ''}`);
+          }
         }
       }
     }
