@@ -246,6 +246,46 @@ export async function startGateway() {
   config.agents.defaults = config.agents.defaults || {};
   delete config.agents.defaults.persona;
 
+  // --- INJECT REQUIRED MODEL ALIASES FOR SOUL.MD ROUTING ---
+  // The 'optimise' plan relies on specific model aliases (haiku, sonnet, etc.)
+  // and expects Haiku as the primary default. We inject these automatically so
+  // users only need to provide their API keys via the Web UI.
+  config.agents.defaults.model = config.agents.defaults.model || {};
+  
+  // Set primary model to 'haiku' if it's currently the factory default or missing
+  if (!config.agents.defaults.model.primary || config.agents.defaults.model.primary === 'anthropic/claude-sonnet-4') {
+    config.agents.defaults.model.primary = 'anthropic/claude-haiku-4-5';
+    console.log('Auto-set primary model to anthropic/claude-haiku-4-5 (Optimise default)');
+  }
+
+  // Inject required aliases without overwriting existing user-defined ones
+  config.agents.defaults.models = config.agents.defaults.models || {};
+  const requiredModels = {
+    "anthropic/claude-opus-4-6": { "alias": "opus" },
+    "anthropic/claude-sonnet-4-6": { "alias": "sonnet" },
+    "anthropic/claude-haiku-4-5": { "alias": "haiku" },
+    "openai/gpt-5-mini": { "alias": "gpt-5-mini" },
+    "openai/gpt-5.1": { "alias": "gpt-5.1" },
+    "google/gemini-2.0-flash": { "alias": "gemini-flash" },
+    "google/gemini-2.0-pro": { "alias": "gemini-pro" },
+    "deepseek/deepseek-chat": { "alias": "deepseek" },
+    "deepseek/deepseek-reasoner": { "alias": "deepseek-r1" }
+  };
+
+  let injectedAliases = 0;
+  for (const [providerModel, defaultSettings] of Object.entries(requiredModels)) {
+    if (!config.agents.defaults.models[providerModel]) {
+      config.agents.defaults.models[providerModel] = defaultSettings;
+      injectedAliases++;
+    } else if (!config.agents.defaults.models[providerModel].alias) {
+      config.agents.defaults.models[providerModel].alias = defaultSettings.alias;
+      injectedAliases++;
+    }
+  }
+  if (injectedAliases > 0) {
+    console.log(`Auto-injected ${injectedAliases} missing model aliases for Optimise service routing`);
+  }
+
   // NOTE: Default SOUL.md creation has been moved to the PRE-BOOT OPTIMIZATION INJECTION section below.
   // The optimized SOUL.md with model routing rules will be written there instead.
 
