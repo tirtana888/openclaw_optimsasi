@@ -258,41 +258,9 @@ export async function startGateway() {
     console.log('Auto-set primary model to anthropic/claude-haiku-4-5 (Optimise default)');
   }
 
-  // Inject required aliases and caching params without overwriting existing user-defined ones
-  config.agents.defaults.models = config.agents.defaults.models || {};
-  const requiredModels = {
-    "anthropic/claude-opus-4-6": { "alias": "opus", "params": { "cacheRetention": "long" } },
-    "anthropic/claude-sonnet-4-6": { "alias": "sonnet", "params": { "cacheRetention": "short" } },
-    "anthropic/claude-haiku-4-5": { "alias": "haiku" },
-    "openai/gpt-5-mini": { "alias": "gpt-5-mini" },
-    "openai/gpt-5.1": { "alias": "gpt-5.1" },
-    "google/gemini-2.0-flash": { "alias": "gemini-flash" },
-    "google/gemini-2.0-pro": { "alias": "gemini-pro" },
-    "deepseek/deepseek-chat": { "alias": "deepseek" },
-    "deepseek/deepseek-reasoner": { "alias": "deepseek-r1" }
-  };
-
-  let injectedOverrides = 0;
-  for (const [providerModel, defaultSettings] of Object.entries(requiredModels)) {
-    if (!config.agents.defaults.models[providerModel]) {
-      config.agents.defaults.models[providerModel] = defaultSettings;
-      injectedOverrides++;
-    } else {
-      let updated = false;
-      if (!config.agents.defaults.models[providerModel].alias) {
-        config.agents.defaults.models[providerModel].alias = defaultSettings.alias;
-        updated = true;
-      }
-      if (defaultSettings.params && !config.agents.defaults.models[providerModel].params) {
-        config.agents.defaults.models[providerModel].params = defaultSettings.params;
-        updated = true;
-      }
-      if (updated) injectedOverrides++;
-    }
-  }
-  if (injectedOverrides > 0) {
-    console.log(`Auto-injected ${injectedOverrides} model settings (aliases/caching) for Optimise service`);
-  }
+  // Note: Model alias and cacheRetention injections were removed here because 
+  // older versions of the OpenClaw daemon do not support the 'models' key 
+  // inside 'agents.defaults' and crash on startup.
 
   // Ensure provider definitions exist for fallbacks (OpenAI & DeepSeek)
   config.models = config.models || {};
