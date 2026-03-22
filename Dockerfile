@@ -121,7 +121,7 @@ COPY --from=wrapper-builder /app/package.json ./package.json
 # Copy entrypoint script and SOUL.md
 COPY entrypoint.sh /entrypoint.sh
 COPY SOUL.md /app/SOUL.md
-RUN chmod +x /entrypoint.sh
+RUN apt-get update && apt-get install -y --no-install-recommends dos2unix && dos2unix /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Copy pre-bundled skills (Railway-optimized)
 COPY skills/ /bundled-skills/
