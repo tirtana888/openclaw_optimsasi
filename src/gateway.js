@@ -499,52 +499,10 @@ export async function startGateway() {
     }
   }
 
-  // ===== PRE-BOOT OPTIMIZATION INJECTION =====
-  // Inject cost optimization settings DIRECTLY into the in-memory config
-  // BEFORE writing to disk and BEFORE spawning the gateway process.
-  // This ensures the gateway reads the optimized config on its very first boot.
-  console.log('Injecting cost optimization settings into config (pre-boot)...');
-
-  // Set primary model to Haiku
-  config.agents = config.agents || {};
-  config.agents.defaults = config.agents.defaults || {};
-  config.agents.defaults.model = { primary: "anthropic/claude-haiku-4-5" };
-
-  // Register all model aliases with prompt caching params
-  config.agents.defaults.models = {
-    "anthropic/claude-opus-4-6": { alias: "opus", params: { cacheRetention: "long" } },
-    "anthropic/claude-sonnet-4-6": { alias: "sonnet", params: { cacheRetention: "short" } },
-    "anthropic/claude-haiku-4-5": { alias: "haiku" },
-    "openai/gpt-5-mini": { alias: "gpt-5-mini" },
-    "openai/gpt-5.1": { alias: "gpt-5.1" },
-    "google/gemini-2.0-flash": { alias: "gemini-flash" },
-    "google/gemini-2.0-pro": { alias: "gemini-pro" },
-    "deepseek/deepseek-chat": { alias: "deepseek" },
-    "deepseek/deepseek-reasoner": { alias: "deepseek-r1" }
-  };
-
-  // Heartbeat: keep cache warm via DeepSeek every 55 min
-  config.agents.defaults.heartbeat = {
-    every: "55m",
-    model: "deepseek/deepseek-chat",
-    session: "main",
-    target: "terminal",
-    prompt: "Check-in: keep context cache warm without taking actions."
-  };
-
-  // Context pruning
-  config.agents.defaults.contextPruning = {
-    mode: "cache-ttl",
-    ttl: "1h"
-  };
-
-  // Diagnostics cache trace
-  config.diagnostics = config.diagnostics || {};
-  config.diagnostics.cacheTrace = { enabled: true };
-
-  console.log('Cost optimization config injected into memory (pre-boot).');
-
-  // Write SOUL.md with routing rules BEFORE gateway starts
+  // ===== PRE-BOOT: Write optimized SOUL.md =====
+  // ONLY write the SOUL.md file — no config modifications.
+  // SOUL.md guides the AI's behavior (model selection, cost limits, etc.)
+  // This is 100% safe: it's just writing a text file and cannot crash the gateway.
   const soulPath = join(workspaceDir, 'SOUL.md');
   try {
     console.log(`Writing optimized SOUL.md to ${soulPath} (pre-boot)...`);
@@ -633,7 +591,7 @@ IF YOU HIT A RATE LIMIT ERROR:
   } catch (soulErr) {
     console.warn('Failed to write SOUL.md (pre-boot):', soulErr.message);
   }
-  // ===== END PRE-BOOT OPTIMIZATION INJECTION =====
+  // ===== END PRE-BOOT =====
 
   writeFileSync(configFile, JSON.stringify(config, null, 2));
 
