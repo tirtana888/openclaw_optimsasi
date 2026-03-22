@@ -318,13 +318,9 @@ export async function startGateway() {
     };
   }
 
-  // Inject Advanced Prompt Caching & Context Pruning Rules
-  config.agents.defaults.heartbeat = config.agents.defaults.heartbeat || { "every": "55m" };
-  config.agents.defaults.contextPruning = config.agents.defaults.contextPruning || {
-    "mode": "cache-ttl",
-    "ttl": "1h"
-  };
-  console.log('Auto-injected Provider, Heartbeat and Context Pruning settings for token optimization');
+  // NOTE: heartbeat and contextPruning were removed because they 
+  // violate OpenClaw's strict schema validation and crash the gateway.
+  console.log('Auto-injected Provider settings for token optimization');
 
   // NOTE: Default SOUL.md creation has been moved to the PRE-BOOT OPTIMIZATION INJECTION section below.
   // The optimized SOUL.md with model routing rules will be written there instead.

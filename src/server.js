@@ -1637,7 +1637,7 @@ app.get('/openclaw/{*path}', openclawHandler);  // catch subpath refreshes like 
 // Proxy all other requests to gateway (when running)
 // Note: Using no path argument to avoid Express 5 stripping req.url
 // (/{*path} would set req.url to "/" for every request, breaking the proxy)
-app.use((req, res, next) => {
+app.use(authMiddleware, (req, res, next) => {
   if (!isGatewayRunning()) {
     const acceptsHtml = req.headers.accept && req.headers.accept.includes('text/html');
     if (acceptsHtml) {
