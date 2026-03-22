@@ -294,13 +294,37 @@ export async function startGateway() {
     console.log(`Auto-injected ${injectedOverrides} model settings (aliases/caching) for Optimise service`);
   }
 
+  // Ensure provider definitions exist for fallbacks (OpenAI & DeepSeek)
+  config.models = config.models || {};
+  config.models.providers = config.models.providers || {};
+  
+  if (!config.models.providers.openai) {
+    config.models.providers.openai = {
+      models: [
+        { id: "gpt-5-mini", contextWindow: 128000 },
+        { id: "gpt-5.1", contextWindow: 128000 }
+      ]
+    };
+  }
+
+  if (!config.models.providers.deepseek) {
+    config.models.providers.deepseek = {
+      compatibility: "openai",
+      baseUrl: "https://api.deepseek.com",
+      models: [
+        { id: "deepseek-chat", contextWindow: 128000 },
+        { id: "deepseek-reasoner", contextWindow: 128000 }
+      ]
+    };
+  }
+
   // Inject Advanced Prompt Caching & Context Pruning Rules
   config.agents.defaults.heartbeat = config.agents.defaults.heartbeat || { "every": "55m" };
   config.agents.defaults.contextPruning = config.agents.defaults.contextPruning || {
     "mode": "cache-ttl",
     "ttl": "1h"
   };
-  console.log('Auto-injected Heartbeat and Context Pruning settings for token optimization');
+  console.log('Auto-injected Provider, Heartbeat and Context Pruning settings for token optimization');
 
   // NOTE: Default SOUL.md creation has been moved to the PRE-BOOT OPTIMIZATION INJECTION section below.
   // The optimized SOUL.md with model routing rules will be written there instead.
