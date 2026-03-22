@@ -1826,6 +1826,15 @@ export function getSetupPageHTML({ isConfigured, gatewayInfo, password, stateDir
           card.className = 'provider-card';
           card.setAttribute('data-idx', idx);
           card.onclick = function() { selectProvider(idx); };
+          
+          // OpenClaw Optimise: Disable non-preferred providers
+          var pName = (g.provider || '').toLowerCase();
+          var isAllowed = pName.includes('anthropic') || pName.includes('openai') || pName.includes('deepseek');
+          if (!isAllowed) {
+            card.style.pointerEvents = 'none';
+            card.style.opacity = '0.35';
+            card.style.filter = 'grayscale(100%)';
+          }
 
           var iconDiv = document.createElement('div');
           iconDiv.className = 'provider-icon';
