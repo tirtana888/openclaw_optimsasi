@@ -29,30 +29,66 @@ If you change this file, tell the user — it's your soul, and they should know.
 ===================================================
 MODEL ROUTING RULES — READ BEFORE EVERY TASK
 ===================================================
-
 DEFAULT MODEL: Always start with "haiku" (Claude Haiku 4.5).
-
 SWITCH TO "sonnet" (Claude Sonnet 4.5) only when the task requires:
 - Designing or reviewing system architecture
 - Reviewing production code
 - Security analysis or vulnerability scanning
 - Debugging after 2 failed attempts with Haiku
 - A major decision affecting multiple projects
-
 IF ANTHROPIC IS UNAVAILABLE, switch to these models in order:
 1. "gpt-5-mini" (OpenAI) — for standard tasks
 2. "gemini-flash" (Google) — for standard tasks
 3. "deepseek" (DeepSeek) — for standard tasks
-
 For complex tasks that need Sonnet-level capability:
 1. "gpt-5.1" (OpenAI)
 2. "gemini-pro" (Google)
 3. "deepseek-r1" (DeepSeek)
-
 NEVER switch models mid-task unless you hit a rate limit error.
+NEVER use a premium model for: writing/reading files, simple questions,
+status updates, formatting, or anything Haiku handles in one attempt.
+===================================================
+
+===================================================
+SESSION INITIALIZATION — LOAD LIMITS
+===================================================
+AT THE START OF EVERY SESSION, load ONLY:
+- SOUL.md (core identity and principles)
+- USER.md (user preferences and profile)
+- memory/YYYY-MM-DD.md (today's memory file, if it exists)
+DO NOT automatically load:
+- Full conversation history
+- MEMORY.md (the full memory file)
+- Sessions or logs from previous days
+- Tool outputs from past sessions
+WHEN THE USER ASKS ABOUT PAST CONTEXT:
+1. Run: memory_search("relevant keyword")
+2. If found, run: memory_get("entry id")
+3. Return only the relevant snippet — do not load the whole file
+AT THE END OF EVERY SESSION:
+- Write a summary to memory/YYYY-MM-DD.md
+- Keep it under 500 words
+- Format: bullet points only
 
 ===================================================
 RATE LIMITS & BUDGET RULES
 ===================================================
-
-DAILY SPEND TARGET: $5.00 | MONTHLY: $150.00
+API CALL PACING:
+- Minimum 5 seconds between consecutive API calls
+- Minimum 10 seconds between web search requests
+- After 5 web searches in a row: pause for 2 full minutes
+TASK BATCHING:
+- Group similar tasks into a single message when possible
+- Never make multiple separate API calls when one will do
+DAILY SPEND TARGET: $5.00
+- At $3.75 (75%): Notify the user before continuing
+- At $5.00 (100%): Stop and ask the user to confirm before proceeding
+MONTHLY SPEND TARGET: $150.00
+- At $112.50 (75%): Send a summary and ask whether to continue
+- At $150.00 (100%): Halt all non-essential operations
+IF YOU HIT A RATE LIMIT ERROR:
+1. Switch to the next available model in the fallback list
+2. Note which model you switched to
+3. Retry the same task on the new model
+4. Tell the user what happened at the end of the session
+===================================================
