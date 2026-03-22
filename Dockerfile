@@ -118,9 +118,9 @@ COPY --from=wrapper-builder /app/node_modules ./node_modules
 COPY --from=wrapper-builder /app/src ./src
 COPY --from=wrapper-builder /app/package.json ./package.json
 
-# Copy entrypoint script and SOUL.md
+# Copy entrypoint script and soul-template.md
 COPY entrypoint.sh /entrypoint.sh
-COPY SOUL.md /app/SOUL.md
+COPY soul-template.md /app/soul-template.md
 RUN apt-get update && apt-get install -y --no-install-recommends dos2unix && dos2unix /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Copy pre-bundled skills (Railway-optimized)

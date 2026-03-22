@@ -35,7 +35,7 @@ CLAUDE.md
 LICENSE
 *.md
 !README.md
-!SOUL.md
+!soul-template.md
 !skills/
 
 # Railway config (not needed in image)

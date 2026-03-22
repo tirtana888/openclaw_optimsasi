@@ -208,28 +208,24 @@ fi
 echo ""
 
 # ==============================================================================
-# FAILSAFE: Hardcode SOUL.md
-# Run a background loop that constantly copies the static SOUL.md from /app
-# to the workspace, ensuring no Node.js process can ever permanently overwrite it.
+# FIRST BOOT SEEDING: SOUL.md
+# Seed the default SOUL.md if it doesn't exist, but respect user modifications.
 # ==============================================================================
-echo "Starting SOUL.md enforcer loop in background..."
-(
-  set +e
-  while true; do
-    if [ -f "/app/SOUL.md" ]; then
-      if [ -d "$OPENCLAW_WORKSPACE_DIR" ]; then
-        cp -f /app/SOUL.md "$OPENCLAW_WORKSPACE_DIR/SOUL.md" >/dev/null 2>&1 || true
-        chown openclaw:openclaw "$OPENCLAW_WORKSPACE_DIR/SOUL.md" >/dev/null 2>&1 || true
-      fi
-      if [ -d "$OPENCLAW_STATE_DIR/workspace" ]; then
-        cp -f /app/SOUL.md "$OPENCLAW_STATE_DIR/workspace/SOUL.md" >/dev/null 2>&1 || true
-        chown openclaw:openclaw "$OPENCLAW_STATE_DIR/workspace/SOUL.md" >/dev/null 2>&1 || true
-      fi
-    fi
-    sleep 30
-  done
-) &
+SOUL_PATH="${OPENCLAW_WORKSPACE_DIR:-/data/workspace}/SOUL.md"
 
+if [ ! -f "$SOUL_PATH" ]; then
+  if [ -f "/app/soul-template.md" ]; then
+    echo "SOUL.md not found in workspace, seeding from template..."
+    mkdir -p "$(dirname "$SOUL_PATH")"
+    cp /app/soul-template.md "$SOUL_PATH"
+    if [ "$(id -u)" = "0" ]; then
+        chown openclaw:openclaw "$SOUL_PATH" >/dev/null 2>&1 || true
+    fi
+    echo "SOUL.md seeded."
+  fi
+else
+  echo "SOUL.md already exists in workspace, skipping seed."
+fi
 # Start the wrapper server (drop to openclaw user if running as root)
 if [ "$(id -u)" = "0" ]; then
     exec su -s /bin/bash openclaw -c "exec node /app/src/server.js"
