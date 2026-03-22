@@ -935,57 +935,72 @@ async function runPostStartupTasks(configFile, context = '') {
   }
 
   // 5. Apply Model Routing, DeepSeek Heartbeat & Prompt Caching Rules
+  // Uses direct file manipulation instead of CLI commands for reliability
   try {
     console.log(`Injecting Cost Optimization settings into agents.defaults...${logSuffix}`);
-    const optimizationPayload = {
-      model: {
-        primary: "anthropic/claude-haiku-4-5"
-      },
-      models: {
-        "anthropic/claude-opus-4-6": { alias: "opus", params: { cacheRetention: "long" } },
-        "anthropic/claude-sonnet-4-6": { alias: "sonnet", params: { cacheRetention: "short" } },
-        "anthropic/claude-haiku-4-5": { alias: "haiku" },
-        "openai/gpt-5-mini": { alias: "gpt-5-mini" },
-        "openai/gpt-5.1": { alias: "gpt-5.1" },
-        "google/gemini-2.0-flash": { alias: "gemini-flash" },
-        "google/gemini-2.0-pro": { alias: "gemini-pro" },
-        "deepseek/deepseek-chat": { alias: "deepseek" },
-        "deepseek/deepseek-reasoner": { alias: "deepseek-r1" }
-      },
-      heartbeat: {
-        every: "55m",
-        model: "deepseek/deepseek-chat",
-        session: "main",
-        target: "terminal", 
-        prompt: "Check-in: keep context cache warm without taking actions."
-      },
-      contextPruning: {
-        mode: "cache-ttl",
-        ttl: "1h"
-      }
+    const liveConfig = JSON.parse(readFileSync(configFile, 'utf-8'));
+
+    // Ensure agents.defaults exists
+    liveConfig.agents = liveConfig.agents || {};
+    liveConfig.agents.defaults = liveConfig.agents.defaults || {};
+
+    // Set the primary model to Haiku
+    liveConfig.agents.defaults.model = { primary: "anthropic/claude-haiku-4-5" };
+
+    // Register all model aliases with caching params
+    liveConfig.agents.defaults.models = {
+      "anthropic/claude-opus-4-6": { alias: "opus", params: { cacheRetention: "long" } },
+      "anthropic/claude-sonnet-4-6": { alias: "sonnet", params: { cacheRetention: "short" } },
+      "anthropic/claude-haiku-4-5": { alias: "haiku" },
+      "openai/gpt-5-mini": { alias: "gpt-5-mini" },
+      "openai/gpt-5.1": { alias: "gpt-5.1" },
+      "google/gemini-2.0-flash": { alias: "gemini-flash" },
+      "google/gemini-2.0-pro": { alias: "gemini-pro" },
+      "deepseek/deepseek-chat": { alias: "deepseek" },
+      "deepseek/deepseek-reasoner": { alias: "deepseek-r1" }
     };
-    
-    // Inject Diagnostics Cache Trace
-    await runCmd('config', ['set', '--json', 'diagnostics.cacheTrace.enabled', 'true']);
-    
-    // Set Agents defaults
-    await runCmd('config', ['set', '--json', 'agents.defaults', JSON.stringify(optimizationPayload)]);
-    
-    console.log(`Cost optimization settings applied effectively.${logSuffix}`);
+
+    // Heartbeat: keep cache warm via DeepSeek
+    liveConfig.agents.defaults.heartbeat = {
+      every: "55m",
+      model: "deepseek/deepseek-chat",
+      session: "main",
+      target: "terminal",
+      prompt: "Check-in: keep context cache warm without taking actions."
+    };
+
+    // Context pruning
+    liveConfig.agents.defaults.contextPruning = {
+      mode: "cache-ttl",
+      ttl: "1h"
+    };
+
+    // Diagnostics cache trace
+    liveConfig.diagnostics = liveConfig.diagnostics || {};
+    liveConfig.diagnostics.cacheTrace = { enabled: true };
+
+    writeFileSync(configFile, JSON.stringify(liveConfig, null, 2));
+    console.log(`Cost optimization settings written directly to config file.${logSuffix}`);
+
+    // Also push via RPC so the running gateway picks it up without restart
+    try {
+      const { gatewayRPC } = await import('./gateway-rpc.js');
+      await gatewayRPC('config.set', { raw: JSON.stringify(liveConfig) });
+      console.log(`Pushed optimization config to gateway via RPC${logSuffix}`);
+    } catch (rpcErr) {
+      console.warn(`config.set RPC for optimizations failed${logSuffix}: ${rpcErr.message}`);
+    }
   } catch (optErr) {
     console.warn(`Failed to apply optimizations${logSuffix}: ${optErr.message}`);
   }
 
-  // 6. Generate optimized SOUL.md if it doesn't exist
+  // 6. Generate optimized SOUL.md (ALWAYS overwrite to ensure latest rules are applied)
   try {
-    const fs = require('fs');
-    const path = require('path');
     const workspaceDir = process.env.OPENCLAW_WORKSPACE_DIR || '/data/workspace';
-    const soulPath = path.join(workspaceDir, 'SOUL.md');
-    
-    if (!fs.existsSync(soulPath) || fs.readFileSync(soulPath, 'utf8').trim() === '') {
-      console.log(`Generating optimized SOUL.md to govern model routing and limits...${logSuffix}`);
-      const soulContent = `===================================================
+    const soulPath = join(workspaceDir, 'SOUL.md');
+
+    console.log(`Writing optimized SOUL.md to ${soulPath}...${logSuffix}`);
+    const soulContent = `===================================================
 MODEL ROUTING RULES — READ BEFORE EVERY TASK
 ===================================================
 
@@ -1064,11 +1079,10 @@ IF YOU HIT A RATE LIMIT ERROR:
 3. Retry the same task on the new model
 4. Tell the user what happened at the end of the session
 ===================================================`;
-      
-      fs.mkdirSync(workspaceDir, { recursive: true });
-      fs.writeFileSync(soulPath, soulContent, 'utf8');
-      console.log(`SOUL.md generated successfully.${logSuffix}`);
-    }
+
+    mkdirSync(workspaceDir, { recursive: true });
+    writeFileSync(soulPath, soulContent, 'utf8');
+    console.log(`SOUL.md generated/overwritten successfully.${logSuffix}`);
   } catch (soulErr) {
     console.warn(`Failed to initialize SOUL.md${logSuffix}: ${soulErr.message}`);
   }
