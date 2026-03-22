@@ -1,0 +1,1067 @@
+/**
+ * Gateway process manager for OpenClaw
+ *
+ * Handles spawning, monitoring, and graceful shutdown of the OpenClaw gateway process
+ */
+
+import { spawn } from 'child_process';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, readdirSync, renameSync, symlinkSync, lstatSync, rmSync } from 'fs';
+import { join } from 'path';
+import crypto from 'crypto';
+import { setGatewayReady } from './health.js';
+import { migrateConfig, getDefaultConfig } from './schema/index.js';
+
+let gatewayProcess = null;
+let isShuttingDown = false;
+let isStarting = false;
+let daemonAdopted = false;  // True when the gateway daemon outlives the CLI process
+let daemonPollTimer = null; // Health-poll interval when in adopted mode
+
+// Log buffering for UI panel
+const LOG_BUFFER_MAX = 1000;
+let logBuffer = [];
+let logIdCounter = 0;
+let gatewayStartTime = null;
+
+/**
+ * Buffer a log line from the gateway process
+ * @param {'stdout'|'stderr'} stream - Which stream the line came from
+ * @param {string} text - The log text
+ */
+function bufferLogLine(stream, text) {
+  logIdCounter++;
+  logBuffer.push({
+    id: logIdCounter,
+    timestamp: Date.now(),
+    stream,
+    text
+  });
+  if (logBuffer.length > LOG_BUFFER_MAX) {
+    logBuffer = logBuffer.slice(logBuffer.length - LOG_BUFFER_MAX);
+  }
+}
+
+/**
+ * Get or generate the gateway token
+ * @returns {string} Gateway authentication token
+ */
+export function getGatewayToken() {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+  const tokenFile = join(stateDir, 'gateway.token');
+
+  // Check if token is set via environment variable
+  if (process.env.OPENCLAW_GATEWAY_TOKEN) {
+    return process.env.OPENCLAW_GATEWAY_TOKEN;
+  }
+
+  // Check if token file exists
+  if (existsSync(tokenFile)) {
+    return readFileSync(tokenFile, 'utf-8').trim();
+  }
+
+  // Generate new token
+  const token = crypto.randomBytes(32).toString('hex');
+
+  // Ensure directory exists
+  mkdirSync(stateDir, { recursive: true });
+
+  // Save token
+  writeFileSync(tokenFile, token, { mode: 0o600 });
+  console.log('Generated new gateway token');
+
+  return token;
+}
+
+/**
+ * Check if the gateway is currently running
+ * @returns {boolean} True if gateway is running
+ */
+export function isGatewayRunning() {
+  return daemonAdopted || (gatewayProcess !== null && !gatewayProcess.killed);
+}
+
+/**
+ * Start polling an adopted daemon's health.
+ * Detects when the daemon restarts (port goes down briefly) and re-adopts
+ * once it comes back, keeping daemonAdopted/gatewayReady in sync.
+ */
+function startDaemonPoll(port) {
+  stopDaemonPoll();
+  let consecutiveFails = 0;
+  const MAX_FAILS = 3;       // allow brief restart windows
+  const POLL_INTERVAL = 3000; // check every 3s
+
+  daemonPollTimer = setInterval(async () => {
+    if (isShuttingDown || gatewayProcess) {
+      // We have a real process now (or shutting down), stop polling
+      stopDaemonPoll();
+      return;
+    }
+    try {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      if (!daemonAdopted) {
+        console.log(`Daemon poll: gateway back on port ${port} — re-adopting`);
+      }
+      consecutiveFails = 0;
+      daemonAdopted = true;
+      gatewayStartTime = gatewayStartTime || Date.now();
+      setGatewayReady(true);
+    } catch {
+      consecutiveFails++;
+      if (consecutiveFails <= MAX_FAILS) {
+        // Transient — daemon likely restarting
+        return;
+      }
+      // Daemon gone for real
+      if (daemonAdopted) {
+        console.log(`Daemon poll: gateway unresponsive after ${consecutiveFails} checks — marking down`);
+        daemonAdopted = false;
+        setGatewayReady(false);
+      }
+    }
+  }, POLL_INTERVAL);
+}
+
+function stopDaemonPoll() {
+  if (daemonPollTimer) {
+    clearInterval(daemonPollTimer);
+    daemonPollTimer = null;
+  }
+}
+
+/**
+ * Start the OpenClaw gateway process
+ * @returns {Promise<void>}
+ */
+export async function startGateway() {
+  if (isGatewayRunning()) {
+    console.log('Gateway is already running');
+    return;
+  }
+
+  // Prevent concurrent startGateway() calls (e.g. overlapping restart timers)
+  if (isStarting) {
+    console.log('Gateway start already in progress, skipping');
+    return;
+  }
+  isStarting = true;
+
+  const port = process.env.INTERNAL_GATEWAY_PORT || '18789';
+  const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+  const workspaceDir = process.env.OPENCLAW_WORKSPACE_DIR || '/data/workspace';
+
+  isShuttingDown = false;
+
+  // Check if a gateway is already responding on the port (orphan from a previous
+  // spawn cycle or a daemon that outlived its parent process). If so, adopt it
+  // as our active gateway instead of spawning a new one — this breaks the
+  // crash-restart loop where spawn → exit → restart → spawn endlessly.
+  try {
+    await fetch(`http://127.0.0.1:${port}/health`);
+    // Port is responding — adopt the running gateway
+    console.log(`Gateway already responding on port ${port} — adopting as active`);
+    daemonAdopted = true;
+    setGatewayReady(true);
+    gatewayStartTime = gatewayStartTime || Date.now();
+    startDaemonPoll(port);
+    isStarting = false;
+    return;
+  } catch {
+    // Port not in use — proceed with normal start
+  }
+
+  stopDaemonPoll();
+  daemonAdopted = false;
+  console.log(`Starting OpenClaw gateway on port ${port}...`);
+
+  // Symlink HOME-derived workspace to the persistent volume so memories survive redeploys.
+  // OpenClaw uses $HOME/.openclaw/workspace internally, which with HOME=/home/openclaw
+  // resolves to /home/openclaw/.openclaw/workspace — NOT on the /data volume.
+  // Derive from HOME env so tests on macOS (where /home is read-only) still work.
+  const homeOpenclawDir = join(process.env.HOME || '/home/openclaw', '.openclaw');
+  const homeWorkspace = join(homeOpenclawDir, 'workspace');
+  try {
+    mkdirSync(homeOpenclawDir, { recursive: true });
+    if (existsSync(homeWorkspace) && !lstatSync(homeWorkspace).isSymbolicLink()) {
+      // Real dir exists — move any files to persistent location, then replace with symlink
+      const files = readdirSync(homeWorkspace);
+      for (const f of files) {
+        const src = join(homeWorkspace, f);
+        const dest = join(workspaceDir, f);
+        if (!existsSync(dest)) {
+          renameSync(src, dest);
+        }
+      }
+      rmSync(homeWorkspace, { recursive: true, force: true });
+    }
+    if (!existsSync(homeWorkspace)) {
+      symlinkSync(workspaceDir, homeWorkspace);
+      console.log(`Symlinked ${homeWorkspace} -> ${workspaceDir}`);
+    }
+  } catch (e) {
+    console.warn(`Workspace symlink setup skipped: ${e.message}`);
+  }
+  // Ensure memory subdirectory exists on the persistent volume
+  mkdirSync(join(workspaceDir, 'memory'), { recursive: true });
+  mkdirSync(join(stateDir, 'workspace', 'memory'), { recursive: true });
+
+  // Create minimal config if not exists
+  const configFile = join(stateDir, 'openclaw.json');
+  if (!existsSync(configFile)) {
+    console.log('Creating minimal configuration...');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(configFile, JSON.stringify(getDefaultConfig(port), null, 2));
+    console.log('Configuration created at', configFile);
+  }
+
+  // Get or generate gateway token
+  const token = getGatewayToken();
+
+  // Export token so child processes (terminal PTY sessions, CLI commands) can
+  // authenticate with the gateway without device pairing
+  process.env.OPENCLAW_GATEWAY_TOKEN = token;
+
+  // Ensure token file exists on disk for the CLI wrapper script (/usr/local/bin/openclaw).
+  // getGatewayToken() skips writing when the env var is already set, so we write here
+  // to cover all shell contexts (docker exec, Railway shell, etc.)
+  const tokenFile = join(stateDir, 'gateway.token');
+  if (!existsSync(tokenFile) || readFileSync(tokenFile, 'utf-8').trim() !== token) {
+    writeFileSync(tokenFile, token, { mode: 0o600 });
+  }
+
+  // Ensure token is in config file for gateway auth
+  const config = JSON.parse(readFileSync(configFile, 'utf-8'));
+
+  // Migrate legacy config keys (agent.* → agents.defaults.* + tools.*)
+  const { migrated, changes } = migrateConfig(config);
+  if (migrated) {
+    console.log('Migrated legacy config keys:');
+    for (const change of changes) {
+      console.log(`  ${change}`);
+    }
+  }
+
+  // Remove legacy persona key (no longer valid in OpenClaw config).
+  config.agents = config.agents || {};
+  config.agents.defaults = config.agents.defaults || {};
+  delete config.agents.defaults.persona;
+
+  // Write a default SOUL.md (identity/persona only) if one doesn't already exist.
+  // Tool awareness belongs in TOOLS.md, which is injected for all agents + sub-agents.
+  const soulPath = join(workspaceDir, 'SOUL.md');
+  if (!existsSync(soulPath)) {
+    writeFileSync(soulPath,
+      '# Soul\n\n' +
+      'You are a helpful, knowledgeable AI assistant running inside an OpenClaw gateway on Railway.\n',
+      'utf8');
+    console.log('Wrote default SOUL.md');
+  }
+
+  // Inject gateway settings (always overwritten by wrapper)
+  config.gateway = config.gateway || {};
+  // Set gateway.port to the wrapper server's external port so the CLI connects through
+  // our reverse proxy. The proxy ensures isLocalDirectRequest() returns true by setting
+  // the right Host header and stripping forwarded headers. The gateway still binds to
+  // INTERNAL_GATEWAY_PORT via the --port CLI flag (which overrides config).
+  const externalPort = parseInt(process.env.PORT || '8080', 10);
+  config.gateway.port = externalPort;
+  config.gateway.auth = { mode: 'token', token };
+  config.gateway.controlUi = config.gateway.controlUi || {};
+  config.gateway.controlUi.basePath = '/openclaw';
+  // Allow token-only auth without device pairing — safe because the gateway is bound
+  // to loopback and our wrapper enforces SETUP_PASSWORD + HTTPS externally.
+  // Note: dangerouslyDisableDeviceAuth has an upstream bug (#29801) where it only
+  // works when shared authentication (Bearer token) is already present on the
+  // connection. The proxy (src/proxy.js) works around this by injecting the gateway
+  // token on dashboard WebSocket upgrades while stripping it from CLI connections.
+  config.gateway.controlUi.allowInsecureAuth = true;
+  config.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
+
+  // Allow the Railway public domain as a WebSocket origin so the Control UI works
+  const publicDomain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  if (publicDomain) {
+    const origins = config.gateway.controlUi.allowedOrigins || [];
+    const httpsOrigin = `https://${publicDomain}`;
+    if (!origins.includes(httpsOrigin)) {
+      origins.push(httpsOrigin);
+    }
+    config.gateway.controlUi.allowedOrigins = origins;
+  }
+
+  // Note: Do NOT set trustedProxies — it tells the gateway that connections from
+  // 127.0.0.1 are proxy-forwarded, which breaks the isLocalDirectRequest() check.
+  // Without trustedProxies, all loopback connections are treated as direct local
+  // clients, enabling auto-approval of device pairing for CLI commands like
+  // `openclaw status --deep`. The proxy already strips x-forwarded-for headers,
+  // so the gateway sees remoteAddr=127.0.0.1 regardless.
+  delete config.gateway.trustedProxies;
+  delete config.gateway.token;
+
+  // Fix channel config validation: dmPolicy="open" requires allowFrom to include "*"
+  if (config.channels) {
+    for (const [name, channel] of Object.entries(config.channels)) {
+      if (channel && channel.dmPolicy === 'open') {
+        if (!Array.isArray(channel.allowFrom)) {
+          channel.allowFrom = ['*'];
+          console.log(`Fixed channels.${name}.allowFrom: set to ["*"] for dmPolicy="open"`);
+        } else if (!channel.allowFrom.includes('*')) {
+          channel.allowFrom.push('*');
+          console.log(`Fixed channels.${name}.allowFrom: added "*" for dmPolicy="open"`);
+        }
+      }
+    }
+  }
+
+  // Ensure memory backend is configured (default to builtin FTS)
+  config.memory = config.memory || {};
+  if (!config.memory.backend) {
+    config.memory.backend = 'builtin';
+    console.log('Set memory backend to builtin');
+  }
+
+  // Auto-enable bundled skills when their env vars are present.
+  // Note: the gateway may rewrite this on startup (v2026.2.22+), so we also
+  // re-apply it after the gateway is ready (see post-startup section below).
+  if (process.env.SEARXNG_URL) {
+    config.skills = config.skills || {};
+    config.skills.entries = config.skills.entries || {};
+    if (!config.skills.entries['searxng-local']) {
+      config.skills.entries['searxng-local'] = { enabled: true };
+      console.log('Auto-enabled searxng-local skill (SEARXNG_URL is set)');
+    }
+  }
+
+  // Ensure tools.exec exists so the agent can use curl for SearXNG web search
+  // and other command-line tools available in the container.
+  // tools.exec is enabled by default in OpenClaw; we just ensure the key is present.
+  config.tools = config.tools || {};
+  if (config.tools.exec === undefined) {
+    config.tools.exec = {};
+    console.log('Initialized tools.exec for shell execution');
+  }
+  // Remove legacy 'enabled' sub-key (not a valid tools.exec field).
+  if (config.tools.exec && config.tools.exec.enabled !== undefined) {
+    delete config.tools.exec.enabled;
+  }
+
+  // Clean up any stale skills.load.extraDirs key from previous versions
+  // (OpenClaw doesn't recognize this key and will reject the config).
+  config.skills = config.skills || {};
+  delete config.skills['load.extraDirs'];
+
+  // Point OpenClaw to the persistent skills directory so it discovers
+  // bundled skills (copied there by entrypoint.sh from /bundled-skills/).
+  // Use skills.load.extraDirs (the valid config key) instead of skills.directory.
+  const skillsDir = join(stateDir, 'skills');
+  delete config.skills.directory;
+  config.skills.load = config.skills.load || {};
+  if (!Array.isArray(config.skills.load.extraDirs)) {
+    config.skills.load.extraDirs = [];
+  }
+  if (!config.skills.load.extraDirs.includes(skillsDir)) {
+    config.skills.load.extraDirs.push(skillsDir);
+  }
+
+  // --- Browser config: force Docker-safe settings every startup ---
+  if (!config.browser) config.browser = {};
+
+  // Clean up stale/invalid fields from previous fixes
+  delete config.browser.launchArgs;
+  delete config.browser.profile;
+
+  // Force managed Chromium profile (the "chrome" profile needs a
+  // desktop browser + relay extension which doesn't exist in Docker)
+  config.browser.defaultProfile = 'openclaw';
+  config.browser.enabled = true;
+  config.browser.headless = true;
+  config.browser.noSandbox = true;
+
+  // Auto-detect Playwright Chromium and set executablePath.
+  // Strategy: try playwright-core API first, then scan filesystem.
+  const pwBrowsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH || '/ms-playwright';
+  let chromeBinary = null;
+
+  // Method 1: Ask playwright-core where its Chromium binary is.
+  // Prefer the active npm-managed runtime, but fall back to the Docker-baked copy.
+  const playwrightCandidates = [
+    join(process.env.NPM_CONFIG_PREFIX || '/data/.npm-global', 'lib', 'node_modules', 'openclaw', 'node_modules', 'playwright-core', 'index.mjs'),
+    '/usr/local/lib/node_modules/openclaw/node_modules/playwright-core/index.mjs'
+  ];
+  for (const importPath of playwrightCandidates) {
+    if (chromeBinary || !existsSync(importPath)) continue;
+    try {
+      const pw = await import(importPath);
+      const candidate = pw.chromium.executablePath();
+      if (candidate && existsSync(candidate)) {
+        chromeBinary = candidate;
+        console.log(`Browser: playwright-core reports Chromium at ${candidate}`);
+      }
+    } catch {
+      // Try the next known playwright-core location.
+    }
+  }
+
+  // Method 2: Scan the Playwright browsers directory for any chrome/chromium binary
+  if (!chromeBinary && existsSync(pwBrowsersPath)) {
+    // Common Playwright binary paths across versions
+    const scanPaths = [
+      ['chrome-linux', 'chrome'],
+      ['chrome-linux64', 'chrome'],     // newer Playwright layout
+      ['chrome-linux', 'chromium'],
+      ['chrome-linux64', 'chromium'],
+      ['chrome-linux', 'headless_shell'],
+      ['chrome-linux64', 'headless_shell'],
+      ['chrome'],
+    ];
+    try {
+      const chromiumDir = readdirSync(pwBrowsersPath).find(d => /^chromium-\d/.test(d));
+      if (chromiumDir) {
+        for (const parts of scanPaths) {
+          const candidate = join(pwBrowsersPath, chromiumDir, ...parts);
+          if (existsSync(candidate)) {
+            chromeBinary = candidate;
+            console.log(`Browser: found Chromium at ${candidate}`);
+            break;
+          }
+        }
+        if (!chromeBinary) {
+          // List what's actually in the directory for debugging
+          const chromiumPath = join(pwBrowsersPath, chromiumDir);
+          const contents = readdirSync(chromiumPath);
+          console.warn(`Browser: no chrome binary found in ${chromiumPath}, contents:`, contents.join(', '));
+        }
+      } else {
+        console.warn('Browser: no chromium-* dir in', pwBrowsersPath,
+          '— found:', readdirSync(pwBrowsersPath).join(', '));
+      }
+    } catch (e) {
+      console.warn('Browser: filesystem scan failed:', e.message);
+    }
+  }
+
+  // Method 3: Use the stable symlink created at Docker build time.
+  if (!chromeBinary) {
+    const stableLink = '/usr/local/bin/chromium';
+    if (existsSync(stableLink)) {
+      chromeBinary = stableLink;
+      console.log(`Browser: using stable symlink at ${stableLink}`);
+    }
+  }
+
+  if (chromeBinary) {
+    config.browser.executablePath = chromeBinary;
+  } else if (!existsSync(pwBrowsersPath)) {
+    console.warn('Browser: Playwright browsers path not found:', pwBrowsersPath);
+  }
+
+  console.log('Browser config:', JSON.stringify(config.browser));
+
+  // Write TOOLS.md with environment-specific tool notes.
+  // TOOLS.md is injected into the system prompt for all agents + sub-agents,
+  // ensuring consistent tool awareness (browser, SearXNG, shell, etc.).
+  const toolsPath = join(workspaceDir, 'TOOLS.md');
+  if (!existsSync(toolsPath)) {
+    let toolsContent = '# Tools\n\n';
+
+    if (chromeBinary) {
+      toolsContent +=
+        '## Browser\n\n' +
+        `A Chromium browser is installed at \`${chromeBinary}\` and available via the built-in browser tool. ` +
+        'Use it for web browsing, taking screenshots, filling forms, and extracting data from web pages. ' +
+        'The browser runs headless in a Docker container.\n\n';
+    }
+
+    if (process.env.SEARXNG_URL) {
+      toolsContent +=
+        '## Web Search\n\n' +
+        'A SearXNG meta-search engine is running as a separate Railway service. ' +
+        'Use the `searxng-local` skill for web searches — read its SKILL.md for the full API reference. ' +
+        `The service URL is available in the \`SEARXNG_URL\` environment variable.\n\n`;
+    }
+
+    toolsContent +=
+      '## Shell\n\n' +
+      'Shell execution (`exec` tool) is available for running commands like `curl`, `node`, `python3`, etc.\n';
+
+    writeFileSync(toolsPath, toolsContent, 'utf8');
+    console.log('Wrote default TOOLS.md with environment tool notes');
+  }
+
+  // Ensure custom provider models have adequate contextWindow.
+  // OpenClaw stores context windows per-model at config.models.providers.<key>.models[].contextWindow
+  // When the CLI creates a custom provider with an unknown model, contextWindow defaults to 4096 —
+  // below the 16000 minimum for agent operation.
+  const providers = config.models?.providers;
+  if (providers && typeof providers === 'object') {
+    for (const [key, providerEntry] of Object.entries(providers)) {
+      if (!providerEntry || !Array.isArray(providerEntry.models)) continue;
+      for (const model of providerEntry.models) {
+        if (model && typeof model === 'object' && model.id) {
+          const ctx = typeof model.contextWindow === 'number' ? model.contextWindow : 0;
+          if (!ctx || ctx < 32000) {
+            model.contextWindow = 200000;
+            console.log(`Auto-set contextWindow=200000 for model "${model.id}" in provider "${key}"`);
+          }
+        }
+      }
+    }
+  }
+
+  writeFileSync(configFile, JSON.stringify(config, null, 2));
+
+  // Start the gateway
+  // Using: openclaw gateway --port PORT --verbose
+  gatewayProcess = spawn('openclaw', [
+    'gateway', 'run',
+    '--bind', 'loopback',
+    '--port', port,
+    '--auth', 'token',
+    '--token', token,
+    '--verbose'
+  ], {
+    env: {
+      ...process.env,
+      HOME: '/home/openclaw',
+      OPENCLAW_STATE_DIR: stateDir,
+      OPENCLAW_WORKSPACE_DIR: workspaceDir,
+      OPENCLAW_BUNDLED_SKILLS_DIR: join(stateDir, 'skills'),
+      PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || '/ms-playwright'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  gatewayStartTime = Date.now();
+
+  gatewayProcess.stdout.on('data', (data) => {
+    const text = data.toString().trim();
+    console.log(`[gateway] ${text}`);
+    bufferLogLine('stdout', text);
+  });
+
+  gatewayProcess.stderr.on('data', (data) => {
+    const text = data.toString().trim();
+    console.error(`[gateway] ${text}`);
+    bufferLogLine('stderr', text);
+  });
+
+  gatewayProcess.on('error', (error) => {
+    console.error('Gateway process error:', error.message);
+    setGatewayReady(false);
+  });
+
+  gatewayProcess.on('exit', (code, signal) => {
+    console.log(`Gateway exited with code ${code}, signal ${signal}`);
+    gatewayProcess = null;
+    setGatewayReady(false);
+
+    if (isShuttingDown) return;
+
+    // The gateway daemon may still be alive on the port after the CLI process
+    // exits. This happens when:
+    //   - code !== 0: crash where the daemon outlives the CLI wrapper
+    //   - code === 0: self-restart via SIGUSR1 (e.g. config change detected)
+    // In both cases, poll until the daemon is responding and adopt it.
+    // The daemon's "full process restart" can take 5-10s (spawn new PID, bind port).
+    const reason = code === 0 ? 'Gateway exited cleanly' : 'Gateway crashed';
+    const maxAttempts = code === 0 ? 8 : 5;
+    const interval = 2000;
+    console.log(`${reason}, polling for daemon (${maxAttempts} attempts, ${interval/1000}s apart)...`);
+
+    let attempt = 0;
+    const pollForDaemon = async () => {
+      attempt++;
+      try {
+        await fetch(`http://127.0.0.1:${port}/health`);
+        // Daemon is alive after self-restart. Rather than adopting blindly,
+        // stop it and restart through the wrapper so config flags like
+        // dangerouslyDisableDeviceAuth are re-injected into the config file.
+        // This is essential after in-app updates via the /openclaw dashboard
+        // because the new version may not honor flags written by older code.
+        console.log(`Gateway daemon alive on port ${port} after ${attempt} attempts — restarting through wrapper for config consistency`);
+        daemonAdopted = true;   // mark adopted so stopGateway can find it
+        isShuttingDown = false;
+        await stopGateway();
+        gatewayStartTime = null;
+        await startGateway();
+        return;
+      } catch {
+        // Daemon not responding yet
+      }
+
+      if (attempt < maxAttempts) {
+        setTimeout(pollForDaemon, interval);
+        return;
+      }
+
+      // Exhausted retries
+      if (code !== 0) {
+        console.log(`Daemon not found after ${maxAttempts} attempts, restarting gateway...`);
+        gatewayStartTime = null;
+        startGateway().catch(err => {
+          console.error('Gateway restart failed:', err.message);
+        });
+      } else {
+        console.log(`Daemon not found after ${maxAttempts} attempts, gateway stopped`);
+      }
+    };
+    setTimeout(pollForDaemon, interval);
+  });
+
+  // Wait for gateway to be ready (up to 90s for cold starts)
+  try {
+    await waitForGateway(port, 90000);
+    syncGatewayToken(configFile, token, stateDir);
+    setGatewayReady(true);
+    isStarting = false;
+    console.log('Gateway is ready');
+
+    await runPostStartupTasks(configFile);
+  } catch (err) {
+    isStarting = false;
+    console.warn(`Initial gateway wait failed: ${err.message}`);
+    // The process may still be starting — poll in the background
+    if (isGatewayRunning()) {
+      console.log('Gateway process is alive, continuing to poll in background...');
+      pollUntilReady(port, configFile, token, stateDir);
+    }
+  }
+}
+
+/**
+ * Run the openclaw onboard command in non-interactive mode
+ * @returns {Promise<void>}
+ */
+async function runOnboard() {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+  const workspaceDir = process.env.OPENCLAW_WORKSPACE_DIR || '/data/workspace';
+
+  return new Promise((resolve, reject) => {
+    const onboard = spawn('openclaw', ['onboard', '--non-interactive', '--accept-risk'], {
+      env: {
+        ...process.env,
+        HOME: '/home/openclaw',
+        OPENCLAW_STATE_DIR: stateDir,
+        OPENCLAW_WORKSPACE_DIR: workspaceDir,
+        PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || '/ms-playwright'
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    onboard.stdout.on('data', (data) => {
+      console.log(`[onboard] ${data.toString().trim()}`);
+    });
+
+    onboard.stderr.on('data', (data) => {
+      console.error(`[onboard] ${data.toString().trim()}`);
+    });
+
+    onboard.on('error', reject);
+    onboard.on('exit', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Onboard exited with code ${code}`));
+      }
+    });
+  });
+}
+
+/**
+ * Run an arbitrary openclaw command and return its output
+ * @param {string} command - The openclaw subcommand (e.g., 'onboard', 'config')
+ * @param {string[]} args - Arguments to pass after the subcommand
+ * @returns {Promise<{stdout: string, stderr: string, code: number}>}
+ */
+export function runCmd(command, args = [], extraEnv = {}) {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+  const workspaceDir = process.env.OPENCLAW_WORKSPACE_DIR || '/data/workspace';
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+
+    const child = spawn('openclaw', [command, ...args], {
+      env: {
+        ...process.env,
+        HOME: '/home/openclaw',
+        OPENCLAW_STATE_DIR: stateDir,
+        OPENCLAW_WORKSPACE_DIR: workspaceDir,
+        PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || '/ms-playwright',
+        ...extraEnv
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    child.stdout.on('data', (data) => { stdout += data.toString(); });
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    child.on('error', (err) => {
+      resolve({ stdout, stderr: stderr + err.message, code: 1 });
+    });
+
+    child.on('exit', (code) => {
+      resolve({ stdout, stderr, code: code ?? 1 });
+    });
+  });
+}
+
+/**
+ * Run an arbitrary command (not prefixed with 'openclaw') and return its output
+ * @param {string} command - The full command name (e.g., 'npx')
+ * @param {string[]} args - Arguments to pass to the command
+ * @param {Object} extraEnv - Additional environment variables
+ * @returns {Promise<{stdout: string, stderr: string, code: number}>}
+ */
+export function runExec(command, args = [], extraEnv = {}) {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+  const workspaceDir = process.env.OPENCLAW_WORKSPACE_DIR || '/data/workspace';
+
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+
+    const child = spawn(command, args, {
+      env: {
+        ...process.env,
+        HOME: '/home/openclaw',
+        OPENCLAW_STATE_DIR: stateDir,
+        OPENCLAW_WORKSPACE_DIR: workspaceDir,
+        PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || '/ms-playwright',
+        ...extraEnv
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    child.stdout.on('data', (data) => { stdout += data.toString(); });
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    child.on('error', (err) => {
+      resolve({ stdout, stderr: stderr + err.message, code: 1 });
+    });
+
+    child.on('exit', (code) => {
+      resolve({ stdout, stderr, code: code ?? 1 });
+    });
+  });
+}
+
+/**
+ * Delete the openclaw configuration file
+ * @returns {boolean} True if file was deleted, false if it didn't exist
+ */
+export function deleteConfig() {
+  const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+  const configFile = join(stateDir, 'openclaw.json');
+
+  if (existsSync(configFile)) {
+    unlinkSync(configFile);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Wait for the gateway to be ready
+ * @param {string} port - Gateway port
+ * @param {number} timeout - Timeout in milliseconds
+ * @returns {Promise<void>}
+ */
+async function waitForGateway(port, timeout = 30000) {
+  const start = Date.now();
+  const endpoints = ['/health', '/', '/openclaw'];
+
+  while (Date.now() - start < timeout) {
+    for (const endpoint of endpoints) {
+      try {
+        await fetch(`http://127.0.0.1:${port}${endpoint}`);
+        // Any response (even 404/401) means the server is listening
+        return;
+      } catch {
+        // Gateway not ready yet (connection refused)
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  throw new Error('Gateway failed to start within timeout');
+}
+
+/**
+ * Sync the gateway token from the config file after startup
+ */
+function syncGatewayToken(configFile, originalToken, stateDir) {
+  try {
+    const liveConfig = JSON.parse(readFileSync(configFile, 'utf-8'));
+    const liveToken = liveConfig.gateway?.auth?.token;
+    if (liveToken && liveToken !== originalToken) {
+      console.log('Gateway changed auth token on startup — syncing token file');
+      const tokenFile = join(stateDir, 'gateway.token');
+      writeFileSync(tokenFile, liveToken, { mode: 0o600 });
+    }
+  } catch (err) {
+    console.error('Failed to sync gateway token:', err.message);
+  }
+}
+
+/**
+ * Run post-startup tasks after the gateway becomes ready.
+ * Extracted to avoid duplication between startGateway() and pollUntilReady().
+ * @param {string} configFile - Path to openclaw.json
+ * @param {string} [context] - Optional label for log messages (e.g. 'background poll')
+ */
+async function runPostStartupTasks(configFile, context = '') {
+  const logSuffix = context ? ` (${context})` : '';
+
+  // 1. Start managed browser profile (gateway doesn't auto-start it)
+  try {
+    const liveConfig = JSON.parse(readFileSync(configFile, 'utf-8'));
+    if (liveConfig.browser?.executablePath) {
+      console.log(`Starting browser profile "openclaw"${logSuffix}...`);
+      const result = await runCmd('browser', ['--browser-profile', 'openclaw', 'start']);
+      if (result.code === 0) {
+        console.log(`Browser profile "openclaw" started${logSuffix}`);
+      } else {
+        console.warn(`Browser profile start code ${result.code}${logSuffix}: ${(result.stderr || result.stdout || '').trim()}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`Browser profile start failed${logSuffix}: ${e.message}`);
+  }
+
+  // 2. Re-apply bundled skill config if the gateway dropped it during startup
+  if (process.env.SEARXNG_URL) {
+    try {
+      const liveConfig = JSON.parse(readFileSync(configFile, 'utf-8'));
+      if (!liveConfig.skills?.entries?.['searxng-local']?.enabled) {
+        liveConfig.skills = liveConfig.skills || {};
+        liveConfig.skills.entries = liveConfig.skills.entries || {};
+        liveConfig.skills.entries['searxng-local'] = { enabled: true };
+        writeFileSync(configFile, JSON.stringify(liveConfig, null, 2));
+        console.log(`Re-applied searxng-local skill${logSuffix} (file)`);
+        try {
+          const { gatewayRPC } = await import('./gateway-rpc.js');
+          await gatewayRPC('config.set', { raw: JSON.stringify(liveConfig) });
+          console.log(`Pushed searxng-local config to gateway via RPC${logSuffix}`);
+        } catch (rpcErr) {
+          console.warn(`config.set RPC for searxng-local failed${logSuffix}: ${rpcErr.message}`);
+        }
+      }
+    } catch (e) {
+      console.warn(`Failed to check/re-apply searxng-local${logSuffix}: ${e.message}`);
+    }
+  }
+
+  // 2b. Re-apply any user-installed skills found on disk
+  try {
+    const liveConfig = JSON.parse(readFileSync(configFile, 'utf-8'));
+    const stateDir = process.env.OPENCLAW_STATE_DIR || '/data/.openclaw';
+    const skillsOnDisk = join(stateDir, 'skills');
+    let changed = false;
+    if (existsSync(skillsOnDisk)) {
+      for (const dir of readdirSync(skillsOnDisk)) {
+        const skillPath = join(skillsOnDisk, dir);
+        if (lstatSync(skillPath).isDirectory() && existsSync(join(skillPath, 'SKILL.md'))) {
+          liveConfig.skills = liveConfig.skills || {};
+          liveConfig.skills.entries = liveConfig.skills.entries || {};
+          if (!liveConfig.skills.entries[dir]?.enabled) {
+            liveConfig.skills.entries[dir] = { enabled: true };
+            changed = true;
+            console.log(`Re-applied skill ${dir}${logSuffix}`);
+          }
+        }
+      }
+    }
+    // Also ensure extraDirs includes the skills directory
+    if (existsSync(skillsOnDisk)) {
+      liveConfig.skills = liveConfig.skills || {};
+      liveConfig.skills.load = liveConfig.skills.load || {};
+      if (!Array.isArray(liveConfig.skills.load.extraDirs)) {
+        liveConfig.skills.load.extraDirs = [];
+      }
+      if (!liveConfig.skills.load.extraDirs.includes(skillsOnDisk)) {
+        liveConfig.skills.load.extraDirs.push(skillsOnDisk);
+        changed = true;
+        console.log(`Re-applied skills.load.extraDirs${logSuffix}`);
+      }
+    }
+    if (changed) {
+      writeFileSync(configFile, JSON.stringify(liveConfig, null, 2));
+      try {
+        const { gatewayRPC } = await import('./gateway-rpc.js');
+        await gatewayRPC('config.set', { raw: JSON.stringify(liveConfig) });
+        console.log(`Pushed re-applied skills to gateway via RPC${logSuffix}`);
+      } catch (rpcErr) {
+        console.warn(`config.set RPC for skills failed${logSuffix}: ${rpcErr.message}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`Failed to re-apply user skills${logSuffix}: ${e.message}`);
+  }
+
+  // 3. Auto-index memory in the background so files created since last restart are searchable
+  runCmd('memory', ['index']).then(result => {
+    if (result.code === 0) {
+      console.log('Memory indexed successfully');
+    } else {
+      console.log('Memory index skipped:', result.stderr.trim());
+    }
+  }).catch(() => {});
+
+  // 4. Auto-install Composio plugin if Consumer Key is present
+  if (process.env.COMPOSIO_CONSUMER_KEY) {
+    try {
+      console.log(`Ensuring Composio plugin is installed for Consumer Key...${logSuffix}`);
+      
+      // Forcefully overwrite the stale configuration from the persistent volume 
+      // by setting the payload to the current environment variable.
+      // This is necessary because cached config takes precedence over process.env.
+      const composioPayload = {
+        enabled: true,
+        config: {
+          consumerKey: process.env.COMPOSIO_CONSUMER_KEY
+        }
+      };
+      await runCmd('config', ['set', '--json', 'plugins.entries.composio', JSON.stringify(composioPayload)]);
+      await runCmd('config', ['set', '--json', 'plugins.allow', '["composio"]']);
+      console.log(`Hard-overwrote composio config and added to plugins.allow...${logSuffix}`);
+
+      // Ensure plugin is installed (safe if already present)
+      await runCmd('plugins', ['install', '@composio/openclaw-plugin']);
+      
+      console.log(`Composio plugin installation verified.${logSuffix}`);
+    } catch (e) {
+      console.warn(`Failed to verify Composio plugin${logSuffix}: ${e.message}`);
+    }
+  }
+}
+/**
+ * Poll for gateway readiness in the background (when initial wait times out)
+ * Checks every 5s for up to 5 minutes
+ */
+function pollUntilReady(port, configFile, originalToken, stateDir) {
+  const maxPollTime = 300000; // 5 minutes
+  const pollInterval = 5000;
+  const start = Date.now();
+
+  const timer = setInterval(async () => {
+    if (!isGatewayRunning()) {
+      console.log('Gateway process exited during background poll');
+      clearInterval(timer);
+      return;
+    }
+    try {
+      await fetch(`http://127.0.0.1:${port}/health`);
+      console.log('Gateway became ready (background poll)');
+      clearInterval(timer);
+      syncGatewayToken(configFile, originalToken, stateDir);
+      setGatewayReady(true);
+
+      await runPostStartupTasks(configFile, 'background poll');
+    } catch {
+      if (Date.now() - start > maxPollTime) {
+        console.error('Gateway did not become ready within 5 minutes');
+        clearInterval(timer);
+      }
+    }
+  }, pollInterval);
+}
+
+/**
+ * Kill the gateway daemon listening on the given port.
+ * Used when we need to stop an adopted daemon that we don't have a process handle for.
+ * Sends SIGTERM to any process owning the port, waits briefly, then SIGKILL if needed.
+ */
+async function killDaemonOnPort(port, timeoutMs = 10000) {
+  const result = await runExec('sh', ['-c', `lsof -ti tcp:${port} -s tcp:listen 2>/dev/null || fuser ${port}/tcp 2>/dev/null | tr -d ' '`]);
+  const pids = (result.stdout || '').trim().split(/\s+/).filter(Boolean).map(Number).filter(n => n > 0 && n !== process.pid);
+  if (pids.length === 0) return;
+
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+    const alive = pids.some(pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
+    if (!alive) return;
+  }
+
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Stop the gateway gracefully
+ * @returns {Promise<void>}
+ */
+export async function stopGateway() {
+  if (!isGatewayRunning()) {
+    return;
+  }
+
+  isShuttingDown = true;
+  stopDaemonPoll();
+  console.log('Stopping gateway...');
+
+  // If we adopted a daemon (no process handle), kill via port lookup
+  if (daemonAdopted && !gatewayProcess) {
+    const port = process.env.INTERNAL_GATEWAY_PORT || '18789';
+    console.log(`Stopping adopted daemon on port ${port}...`);
+    await killDaemonOnPort(port);
+    daemonAdopted = false;
+    setGatewayReady(false);
+    return;
+  }
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      console.log('Gateway did not stop gracefully, killing...');
+      gatewayProcess.kill('SIGKILL');
+      resolve();
+    }, 10000);
+
+    gatewayProcess.once('exit', () => {
+      clearTimeout(timeout);
+      daemonAdopted = false;
+      resolve();
+    });
+
+    gatewayProcess.kill('SIGTERM');
+  });
+}
+
+/**
+ * Get gateway process info
+ * @returns {Object} Process information
+ */
+export function getGatewayInfo() {
+  return {
+    running: isGatewayRunning(),
+    pid: gatewayProcess?.pid || null,
+    port: process.env.INTERNAL_GATEWAY_PORT || '18789'
+  };
+}
+
+/**
+ * Get recent log entries from the gateway process
+ * @param {number} sinceId - Only return entries with id > sinceId (0 for all)
+ * @returns {{entries: Array, lastId: number}}
+ */
+export function getRecentLogs(sinceId = 0) {
+  const entries = logBuffer.filter(e => e.id > sinceId);
+  return {
+    entries,
+    lastId: logBuffer.length > 0 ? logBuffer[logBuffer.length - 1].id : sinceId
+  };
+}
+
+/**
+ * Get gateway uptime in seconds, or null if not running
+ * @returns {number|null}
+ */
+export function getGatewayUptime() {
+  if (!gatewayStartTime || !isGatewayRunning()) return null;
+  return Math.floor((Date.now() - gatewayStartTime) / 1000);
+}

@@ -1,0 +1,46 @@
+{
+  "$id": "skills",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Skills Configuration",
+  "description": "Bundled and installed skill packs",
+  "type": "object",
+  "properties": {
+    "entries": {
+      "type": "object",
+      "description": "Skill entries keyed by slug",
+      "patternProperties": {
+        ".*": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "allowBundled": {
+      "type": "array",
+      "description": "Bundled skill slugs to allow",
+      "items": { "type": "string" }
+    },
+    "load": {
+      "type": "object",
+      "description": "Skill loading configuration",
+      "properties": {
+        "extraDirs": {
+          "type": "array",
+          "description": "Additional directories to load skills from",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "install": {
+      "type": "object",
+      "description": "Skill installation preferences",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

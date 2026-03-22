@@ -1,0 +1,89 @@
+# OpenClaw Railway Template - Local Development Build
+# Skips Stage 1 (no git clone of openclaw repo) and uses mock CLI instead
+
+# ==============================================================================
+# Stage 1: Build the wrapper server (with node-pty native module)
+# ==============================================================================
+FROM node:24-bookworm AS wrapper-builder
+
+# Fix apt sources: use HTTPS to avoid 403 from CDN on Docker Desktop
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources
+
+# Install build dependencies for node-pty
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy package files for wrapper server
+COPY package.json ./
+RUN npm install --omit=dev
+
+# Copy wrapper server source
+COPY src/ ./src/
+
+# ==============================================================================
+# Stage 2: Production runtime with mock CLI
+# ==============================================================================
+FROM node:24-bookworm-slim AS runtime
+
+# Copy CA certificates from builder (slim image doesn't have them)
+COPY --from=wrapper-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Fix apt sources: use HTTPS to avoid 403 from CDN on Docker Desktop
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN groupadd --system --gid 1001 openclaw && \
+    useradd --system --uid 1001 --gid openclaw --shell /bin/bash --create-home openclaw
+
+# Install mock openclaw CLI
+COPY mock/openclaw /usr/local/bin/openclaw
+RUN chmod +x /usr/local/bin/openclaw
+
+WORKDIR /app
+
+# Copy wrapper server from builder
+COPY --from=wrapper-builder /app/node_modules ./node_modules
+COPY --from=wrapper-builder /app/src ./src
+COPY --from=wrapper-builder /app/package.json ./package.json
+
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Create data directory with proper permissions
+RUN mkdir -p /data/.openclaw /data/workspace && \
+    chown -R openclaw:openclaw /data /app
+
+# Volume for persistent data
+VOLUME /data
+
+# Switch to non-root user
+USER openclaw
+
+# Default port
+EXPOSE 8080
+
+# Environment defaults
+ENV NODE_ENV=production \
+    OPENCLAW_STATE_DIR=/data/.openclaw \
+    OPENCLAW_WORKSPACE_DIR=/data/workspace \
+    INTERNAL_GATEWAY_PORT=18789
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
+
+# Use tini as init system for proper signal handling
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

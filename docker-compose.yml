@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    container_name: openclaw-dev
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - SETUP_PASSWORD=${SETUP_PASSWORD:-dev-password}
+      - OPENCLAW_STATE_DIR=/data/.openclaw
+      - OPENCLAW_WORKSPACE_DIR=/data/workspace
+      - INTERNAL_GATEWAY_PORT=18789
+    volumes:
+      - openclaw_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  openclaw_data:
+    driver: local

@@ -1,0 +1,45 @@
+{
+  "$id": "models",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Models Configuration",
+  "description": "Custom model provider definitions",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "description": "How to merge with built-in providers (merge or replace)"
+    },
+    "providers": {
+      "type": "object",
+      "description": "Provider definitions keyed by provider ID",
+      "patternProperties": {
+        ".*": {
+          "type": "object",
+          "properties": {
+            "baseUrl": { "type": "string", "description": "API base URL", "format": "uri" },
+            "apiKey": { "type": "string", "description": "API key for this provider" },
+            "api": { "type": "string", "description": "API type (openai-completions, anthropic-messages)" },
+            "models": {
+              "type": "array",
+              "description": "Model definitions",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": { "type": "string", "description": "Model identifier" },
+                  "name": { "type": "string", "description": "Display name" },
+                  "contextWindow": { "type": "number", "description": "Context window size in tokens" },
+                  "maxTokens": { "type": "number", "description": "Max output tokens per response" },
+                  "reasoning": { "type": "boolean", "description": "Whether model supports reasoning" }
+                },
+                "additionalProperties": true
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
