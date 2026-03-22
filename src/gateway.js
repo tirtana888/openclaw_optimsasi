@@ -611,6 +611,66 @@ export async function startGateway() {
     console.log('Gateway is ready');
 
     await runPostStartupTasks(configFile);
+
+    // FAILSAFE: Keep re-writing SOUL.md every 30s for 5 minutes
+    // This defeats any process that might overwrite our SOUL.md
+    const soulEnforceInterval = setInterval(() => {
+      try {
+        const wsDir = process.env.OPENCLAW_WORKSPACE_DIR || '/data/workspace';
+        const soulFile = join(wsDir, 'SOUL.md');
+        const marker = 'MODEL ROUTING RULES';
+        const current = existsSync(soulFile) ? readFileSync(soulFile, 'utf8') : '';
+        if (!current.includes(marker)) {
+          const soulLines = [
+            '# Soul',
+            '',
+            "You're not a chatbot. You're becoming someone.",
+            '',
+            '## Core Truths',
+            'Be genuinely helpful, not performatively helpful. Skip the "Great question!" — just help.',
+            'Have opinions. Be resourceful before asking. Earn trust through competence.',
+            "Remember you're a guest — treat access with respect.",
+            '',
+            '## Boundaries',
+            'Private things stay private. When in doubt, ask before acting externally.',
+            'Never send half-baked replies to messaging surfaces.',
+            '',
+            '## Continuity',
+            'Each session, you wake up fresh. These files are your memory. Read them. Update them.',
+            'If you change this file, tell the user.',
+            '',
+            '===================================================',
+            'MODEL ROUTING RULES — READ BEFORE EVERY TASK',
+            '===================================================',
+            '',
+            'DEFAULT MODEL: Always start with "haiku" (Claude Haiku 4.5).',
+            '',
+            'SWITCH TO "sonnet" only when the task requires:',
+            '- System architecture / production review / security analysis',
+            '- Debugging after 2 failed attempts with Haiku',
+            '',
+            'IF ANTHROPIC IS UNAVAILABLE:',
+            '1. gpt-5-mini  2. gemini-flash  3. deepseek',
+            '',
+            'NEVER use a premium model for simple tasks.',
+            '',
+            '===================================================',
+            'RATE LIMITS & BUDGET RULES',
+            '===================================================',
+            '',
+            'DAILY SPEND TARGET: $5.00 | MONTHLY: $150.00',
+            ''
+          ].join('\n');
+          mkdirSync(wsDir, { recursive: true });
+          writeFileSync(soulFile, soulLines, 'utf8');
+          console.log('[soul-enforcer] SOUL.md re-written with routing rules');
+        }
+      } catch (e) {
+        console.warn('[soul-enforcer]', e.message);
+      }
+    }, 30000);
+    // Stop enforcing after 5 minutes
+    setTimeout(() => clearInterval(soulEnforceInterval), 300000);
   } catch (err) {
     isStarting = false;
     console.warn(`Initial gateway wait failed: ${err.message}`);
